@@ -73,7 +73,9 @@ def benchmark(problems, output_csv, args):
         num_failure=num_failure,
         device=device,
         leo_mode=args.leo,
-        lam=args.lam)
+        lam=args.lam,
+        leo_N=args.leo_N,
+        leo_M=args.leo_M)
     teal_actor = TealActor(
         teal_env=teal_env,
         num_layer=num_layer,

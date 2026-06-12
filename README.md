@@ -24,6 +24,7 @@ pip install --no-index torch-scatter torch-sparse -f https://data.pyg.org/whl/to
 cd run
 
 python teal.py --leo --topo Starlink.json --tm-model toy --lam 5.0 \
+    --leo-N 72 --leo-M 22 \
     --epochs 50 --samples 5 \
     --slice-train-start 0 --slice-train-stop 80 \
     --slice-val-start 80 --slice-val-stop 90 \
@@ -45,6 +46,8 @@ python teal.py --obj total_flow --topo B4.json --epochs 3 --admm-steps 2
 | `--topo` | required | Topology JSON file (placed in `topologies/`) |
 | `--tm-model` | real | Subfolder name under `traffic-matrices/` |
 | `--lam` | 5.0 | λ in threshold τ = μ + λσ for elephant/mice separation |
+| `--leo-N` | auto | Number of orbits in the LEO grid (e.g. 72 for Starlink) |
+| `--leo-M` | auto | Number of satellites per orbit (e.g. 22 for Starlink) |
 | `--samples` | 5 | Number of counterfactual samples N_s per agent |
 | `--epochs` | 0 | Number of training epochs |
 | `--layers` | 6 | Number of GNN layers |

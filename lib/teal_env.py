@@ -19,6 +19,7 @@ from .config import TOPOLOGIES_DIR
 from .ADMM import ADMM
 from .path_utils import find_paths, graph_copy_with_edge_weights, remove_cycles
 from .flow_identification import identify_elephant_mice
+from .leo_path_utils import precompute_offset_paths, instantiate_paths
 
 
 class TealEnv(object):
@@ -27,7 +28,7 @@ class TealEnv(object):
             self, obj, topo, problems,
             num_path, edge_disjoint, dist_metric, rho,
             train_size, val_size, test_size, num_failure, device,
-            leo_mode=False, lam=5.0,
+            leo_mode=False, lam=5.0, leo_N=None, leo_M=None,
             raw_action_min=-10.0, raw_action_max=10.0):
         """Initialize Teal environment.
 
@@ -68,7 +69,7 @@ class TealEnv(object):
         self.raw_action_max = raw_action_max
 
         if self.leo_mode:
-            self._init_leo(lam, rho)
+            self._init_leo(lam, rho, leo_N, leo_M)
         else:
             self._init_teal(rho)
 
@@ -90,11 +91,11 @@ class TealEnv(object):
             self.p2e, self.num_path, self.num_path_node,
             self.num_edge_node, rho, self.device)
 
-    def _init_leo(self, lam, rho):
+    def _init_leo(self, lam, rho, leo_N=None, leo_M=None):
         """Initialize in ELATE mode.
 
-        Reads topology from JSON (same as TEAL), then sets up
-        elephant/mice flow separation infrastructure.
+        Uses fast O(|V|) path computation via translational invariance
+        (Eq. 5-6) instead of brute-force O(|V|^2) all-pairs search.
         """
         self.lam = lam
 
@@ -108,15 +109,32 @@ class TealEnv(object):
         # edge index lookup
         self.edge2idx = {edge: idx for idx, edge in enumerate(self.G.edges)}
 
-        # pre-compute shortest paths for all pairs (used for mice routing)
+        # Grid dimensions for fast path computation (Eq. 5-6)
+        if leo_N is not None and leo_M is not None:
+            self.N, self.M = leo_N, leo_M
+        else:
+            self.N, self.M = self._infer_grid_dims()
+
+        # Build coordinate mappings (node_id = x * M + y)
+        self.node_to_coord = {}
+        self.coord_to_node = {}
+        for x in range(self.N):
+            for y in range(self.M):
+                node_id = x * self.M + y
+                self.node_to_coord[node_id] = (x, y)
+                self.coord_to_node[(x, y)] = node_id
+
+        # pre-compute shortest paths for mice routing
         print("Pre-computing shortest paths for mice flow routing...")
         self.shortest_paths = dict(nx.all_pairs_shortest_path(self.G))
-        print(f"Topology: {self.num_nodes} nodes, {self.num_edge_node} edges")
 
-        # pre-compute k-shortest paths for elephant flows
-        print("Pre-computing candidate paths...")
-        self.all_path_dict = self._compute_all_paths()
-        print(f"Path dict size: {len(self.all_path_dict)}")
+        # pre-compute offset paths: O(|V|) offsets from origin (Eq. 5-6)
+        print("Pre-computing offset paths (fast O(|V|), Eq. 5-6)...")
+        self.offset_paths = precompute_offset_paths(
+            self.G, self.N, self.M, self.num_path, self.coord_to_node)
+        print(f"Topology: {self.num_nodes} nodes, {self.num_edge_node} edges")
+        print(f"Grid: {self.N} orbits x {self.M} sats/orbit, "
+              f"{len(self.offset_paths)} offsets cached")
 
         # dynamic state (set per observation)
         self.elephant_indices = None
@@ -128,25 +146,18 @@ class TealEnv(object):
         self.edge_index_values = None
         self.p2e = None
 
-    def _compute_all_paths(self):
-        """Pre-compute k-shortest paths for all node pairs."""
-        path_dict = {}
-        G = graph_copy_with_edge_weights(self.G, self.dist_metric)
-        for s_k in G.nodes:
-            for t_k in G.nodes:
-                if s_k == t_k:
-                    continue
-                paths = find_paths(
-                    G, s_k, t_k, self.num_path, self.edge_disjoint)
-                paths_no_cycles = [remove_cycles(path) for path in paths]
-                # pad to num_path if not enough
-                if len(paths_no_cycles) < self.num_path:
-                    paths_no_cycles = [paths_no_cycles[0]] * \
-                        (self.num_path - len(paths_no_cycles)) + paths_no_cycles
-                elif len(paths_no_cycles) > self.num_path:
-                    paths_no_cycles = paths_no_cycles[:self.num_path]
-                path_dict[(s_k, t_k)] = paths_no_cycles
-        return path_dict
+    def _infer_grid_dims(self):
+        """Infer N (orbits) and M (sats/orbit) from node count.
+
+        Assumes N * M = num_nodes and N > M (more orbits than sats per orbit).
+        """
+        n = self.num_nodes
+        best = (n, 1)
+        for m in range(2, int(n**0.5) + 1):
+            if n % m == 0:
+                best = (n // m, m)
+        print(f"Inferred grid dimensions: N={best[0]}, M={best[1]}")
+        return best
 
     def reset(self, mode='test'):
         """Reset the initial conditions in the beginning."""
@@ -254,13 +265,26 @@ class TealEnv(object):
         """Build bipartite graph for elephant flows with augmented bi-adjacency.
 
         Implements Eq. 7: Ā_t = [[I_{|E|}, A_t], [A_t^T, I_{|P|}]]
+        Uses fast path instantiation via Eq. 6 instead of pre-computed dict.
         """
         src, dst = [], []
         path_i = 0
         edge_num = self.num_edge_node
 
         for (s, d) in elephant_pairs:
-            paths = self.all_path_dict.get((s, d), [])
+            # Fast path instantiation (Eq. 6): O(1) per pair
+            paths = instantiate_paths(
+                self.offset_paths,
+                self.node_to_coord[s], self.node_to_coord[d],
+                self.N, self.M,
+                self.coord_to_node, self.node_to_coord)
+            # Pad/truncate to num_path
+            if len(paths) < self.num_path:
+                paths = [paths[0]] * (self.num_path - len(paths)) + paths \
+                    if paths else []
+            elif len(paths) > self.num_path:
+                paths = paths[:self.num_path]
+
             for path in paths:
                 for u, v in zip(path[:-1], path[1:]):
                     if (u, v) in self.edge2idx:

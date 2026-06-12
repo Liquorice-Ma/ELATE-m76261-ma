@@ -112,6 +112,12 @@ def get_args_and_problems(formatted_fname_template, additional_args=[]):
     parser.add_argument(
         '--lam', type=float, default=5.0,
         help='lambda threshold for elephant/mice flow separation')
+    parser.add_argument(
+        '--leo-N', type=int, default=None,
+        help='number of orbits in LEO grid (e.g. 72 for Starlink)')
+    parser.add_argument(
+        '--leo-M', type=int, default=None,
+        help='number of satellites per orbit (e.g. 22 for Starlink)')
 
     # env hyper-parameters
     parser.add_argument(
