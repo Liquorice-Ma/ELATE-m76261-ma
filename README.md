@@ -2,7 +2,7 @@
 
 ELATE is a scalable traffic engineering (TE) framework for large-scale LEO satellite constellations. By exploiting the heavy-tailed distribution of satellite traffic, ELATE decomposes demands into elephant and mice flows, offloading mice to static shortest paths and focusing GNN + Multi-Agent RL optimization on critical elephant flows. Simulation results on a Starlink constellation show that ELATE reduces MLU by 8–29% over baselines while yielding 11–3288× computational speedups.
 
-//Built upon [Teal](https://dl.acm.org/doi/10.1145/3603269.3604857) (ACM SIGCOMM '23).
+Built upon [Teal](https://dl.acm.org/doi/10.1145/3603269.3604857) (ACM SIGCOMM '23).
 
 ## Installation
 
