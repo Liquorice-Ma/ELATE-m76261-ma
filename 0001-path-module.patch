@@ -1,0 +1,218 @@
+From 7d927c6715ac8aff80de90347e5ce2bce383f071 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=AF=93=E6=A6=95?= <yurong.mh@alibaba-inc.com>
+Date: Fri, 12 Jun 2026 14:18:16 +0800
+Subject: [PATCH] path module
+
+---
+ README.md          |  3 ++
+ lib/teal_env.py    | 86 +++++++++++++++++++++++++++++-----------------
+ run/teal.py        |  4 ++-
+ run/teal_helper.py |  6 ++++
+ 4 files changed, 67 insertions(+), 32 deletions(-)
+
+diff --git a/README.md b/README.md
+index 6da9dc9..69e3441 100644
+--- a/README.md
++++ b/README.md
+@@ -24,6 +24,7 @@ pip install --no-index torch-scatter torch-sparse -f https://data.pyg.org/whl/to
+ cd run
+ 
+ python teal.py --leo --topo Starlink.json --tm-model toy --lam 5.0 \
++    --leo-N 72 --leo-M 22 \
+     --epochs 50 --samples 5 \
+     --slice-train-start 0 --slice-train-stop 80 \
+     --slice-val-start 80 --slice-val-stop 90 \
+@@ -45,6 +46,8 @@ python teal.py --obj total_flow --topo B4.json --epochs 3 --admm-steps 2
+ | `--topo` | required | Topology JSON file (placed in `topologies/`) |
+ | `--tm-model` | real | Subfolder name under `traffic-matrices/` |
+ | `--lam` | 5.0 | λ in threshold τ = μ + λσ for elephant/mice separation |
++| `--leo-N` | auto | Number of orbits in the LEO grid (e.g. 72 for Starlink) |
++| `--leo-M` | auto | Number of satellites per orbit (e.g. 22 for Starlink) |
+ | `--samples` | 5 | Number of counterfactual samples N_s per agent |
+ | `--epochs` | 0 | Number of training epochs |
+ | `--layers` | 6 | Number of GNN layers |
+diff --git a/lib/teal_env.py b/lib/teal_env.py
+index f666675..6f78e82 100755
+--- a/lib/teal_env.py
++++ b/lib/teal_env.py
+@@ -19,6 +19,7 @@ from .config import TOPOLOGIES_DIR
+ from .ADMM import ADMM
+ from .path_utils import find_paths, graph_copy_with_edge_weights, remove_cycles
+ from .flow_identification import identify_elephant_mice
++from .leo_path_utils import precompute_offset_paths, instantiate_paths
+ 
+ 
+ class TealEnv(object):
+@@ -27,7 +28,7 @@ class TealEnv(object):
+             self, obj, topo, problems,
+             num_path, edge_disjoint, dist_metric, rho,
+             train_size, val_size, test_size, num_failure, device,
+-            leo_mode=False, lam=5.0,
++            leo_mode=False, lam=5.0, leo_N=None, leo_M=None,
+             raw_action_min=-10.0, raw_action_max=10.0):
+         """Initialize Teal environment.
+ 
+@@ -68,7 +69,7 @@ class TealEnv(object):
+         self.raw_action_max = raw_action_max
+ 
+         if self.leo_mode:
+-            self._init_leo(lam, rho)
++            self._init_leo(lam, rho, leo_N, leo_M)
+         else:
+             self._init_teal(rho)
+ 
+@@ -90,11 +91,11 @@ class TealEnv(object):
+             self.p2e, self.num_path, self.num_path_node,
+             self.num_edge_node, rho, self.device)
+ 
+-    def _init_leo(self, lam, rho):
++    def _init_leo(self, lam, rho, leo_N=None, leo_M=None):
+         """Initialize in ELATE mode.
+ 
+-        Reads topology from JSON (same as TEAL), then sets up
+-        elephant/mice flow separation infrastructure.
++        Uses fast O(|V|) path computation via translational invariance
++        (Eq. 5-6) instead of brute-force O(|V|^2) all-pairs search.
+         """
+         self.lam = lam
+ 
+@@ -108,15 +109,32 @@ class TealEnv(object):
+         # edge index lookup
+         self.edge2idx = {edge: idx for idx, edge in enumerate(self.G.edges)}
+ 
+-        # pre-compute shortest paths for all pairs (used for mice routing)
++        # Grid dimensions for fast path computation (Eq. 5-6)
++        if leo_N is not None and leo_M is not None:
++            self.N, self.M = leo_N, leo_M
++        else:
++            self.N, self.M = self._infer_grid_dims()
++
++        # Build coordinate mappings (node_id = x * M + y)
++        self.node_to_coord = {}
++        self.coord_to_node = {}
++        for x in range(self.N):
++            for y in range(self.M):
++                node_id = x * self.M + y
++                self.node_to_coord[node_id] = (x, y)
++                self.coord_to_node[(x, y)] = node_id
++
++        # pre-compute shortest paths for mice routing
+         print("Pre-computing shortest paths for mice flow routing...")
+         self.shortest_paths = dict(nx.all_pairs_shortest_path(self.G))
+-        print(f"Topology: {self.num_nodes} nodes, {self.num_edge_node} edges")
+ 
+-        # pre-compute k-shortest paths for elephant flows
+-        print("Pre-computing candidate paths...")
+-        self.all_path_dict = self._compute_all_paths()
+-        print(f"Path dict size: {len(self.all_path_dict)}")
++        # pre-compute offset paths: O(|V|) offsets from origin (Eq. 5-6)
++        print("Pre-computing offset paths (fast O(|V|), Eq. 5-6)...")
++        self.offset_paths = precompute_offset_paths(
++            self.G, self.N, self.M, self.num_path, self.coord_to_node)
++        print(f"Topology: {self.num_nodes} nodes, {self.num_edge_node} edges")
++        print(f"Grid: {self.N} orbits x {self.M} sats/orbit, "
++              f"{len(self.offset_paths)} offsets cached")
+ 
+         # dynamic state (set per observation)
+         self.elephant_indices = None
+@@ -128,25 +146,18 @@ class TealEnv(object):
+         self.edge_index_values = None
+         self.p2e = None
+ 
+-    def _compute_all_paths(self):
+-        """Pre-compute k-shortest paths for all node pairs."""
+-        path_dict = {}
+-        G = graph_copy_with_edge_weights(self.G, self.dist_metric)
+-        for s_k in G.nodes:
+-            for t_k in G.nodes:
+-                if s_k == t_k:
+-                    continue
+-                paths = find_paths(
+-                    G, s_k, t_k, self.num_path, self.edge_disjoint)
+-                paths_no_cycles = [remove_cycles(path) for path in paths]
+-                # pad to num_path if not enough
+-                if len(paths_no_cycles) < self.num_path:
+-                    paths_no_cycles = [paths_no_cycles[0]] * \
+-                        (self.num_path - len(paths_no_cycles)) + paths_no_cycles
+-                elif len(paths_no_cycles) > self.num_path:
+-                    paths_no_cycles = paths_no_cycles[:self.num_path]
+-                path_dict[(s_k, t_k)] = paths_no_cycles
+-        return path_dict
++    def _infer_grid_dims(self):
++        """Infer N (orbits) and M (sats/orbit) from node count.
++
++        Assumes N * M = num_nodes and N > M (more orbits than sats per orbit).
++        """
++        n = self.num_nodes
++        best = (n, 1)
++        for m in range(2, int(n**0.5) + 1):
++            if n % m == 0:
++                best = (n // m, m)
++        print(f"Inferred grid dimensions: N={best[0]}, M={best[1]}")
++        return best
+ 
+     def reset(self, mode='test'):
+         """Reset the initial conditions in the beginning."""
+@@ -254,13 +265,26 @@ class TealEnv(object):
+         """Build bipartite graph for elephant flows with augmented bi-adjacency.
+ 
+         Implements Eq. 7: Ā_t = [[I_{|E|}, A_t], [A_t^T, I_{|P|}]]
++        Uses fast path instantiation via Eq. 6 instead of pre-computed dict.
+         """
+         src, dst = [], []
+         path_i = 0
+         edge_num = self.num_edge_node
+ 
+         for (s, d) in elephant_pairs:
+-            paths = self.all_path_dict.get((s, d), [])
++            # Fast path instantiation (Eq. 6): O(1) per pair
++            paths = instantiate_paths(
++                self.offset_paths,
++                self.node_to_coord[s], self.node_to_coord[d],
++                self.N, self.M,
++                self.coord_to_node, self.node_to_coord)
++            # Pad/truncate to num_path
++            if len(paths) < self.num_path:
++                paths = [paths[0]] * (self.num_path - len(paths)) + paths \
++                    if paths else []
++            elif len(paths) > self.num_path:
++                paths = paths[:self.num_path]
++
+             for path in paths:
+                 for u, v in zip(path[:-1], path[1:]):
+                     if (u, v) in self.edge2idx:
+diff --git a/run/teal.py b/run/teal.py
+index 53f5f5b..b8d37f6 100755
+--- a/run/teal.py
++++ b/run/teal.py
+@@ -73,7 +73,9 @@ def benchmark(problems, output_csv, args):
+         num_failure=num_failure,
+         device=device,
+         leo_mode=args.leo,
+-        lam=args.lam)
++        lam=args.lam,
++        leo_N=args.leo_N,
++        leo_M=args.leo_M)
+     teal_actor = TealActor(
+         teal_env=teal_env,
+         num_layer=num_layer,
+diff --git a/run/teal_helper.py b/run/teal_helper.py
+index e7ea9a2..45ba10b 100755
+--- a/run/teal_helper.py
++++ b/run/teal_helper.py
+@@ -112,6 +112,12 @@ def get_args_and_problems(formatted_fname_template, additional_args=[]):
+     parser.add_argument(
+         '--lam', type=float, default=5.0,
+         help='lambda threshold for elephant/mice flow separation')
++    parser.add_argument(
++        '--leo-N', type=int, default=None,
++        help='number of orbits in LEO grid (e.g. 72 for Starlink)')
++    parser.add_argument(
++        '--leo-M', type=int, default=None,
++        help='number of satellites per orbit (e.g. 22 for Starlink)')
+ 
+     # env hyper-parameters
+     parser.add_argument(
+-- 
+2.43.0
+
